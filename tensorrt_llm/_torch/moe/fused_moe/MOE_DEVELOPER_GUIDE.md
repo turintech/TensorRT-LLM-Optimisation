@@ -269,7 +269,7 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
 | `none` | `TrtllmCutlassUnquantizedImpl` | `trtllm.cutlass.grouped_gemm.none` | Fuses routed-expert LoRA |
 | `fp8` | `TrtllmCutlassFp8Impl` | `trtllm.cutlass.grouped_gemm.fp8` | Static per-tensor e4m3 input; fuses routed-expert LoRA |
 | `fp8_block_scales` | `DeepgemmCudaHopperFp8BlockScalesImpl` | `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales` | SM90; `CutlassMoeFCRunner` hands FC1/FC2 to the vendored DeepGEMM |
-| `fp8_block_scales` | `TrtllmTritonFp8BlockScalesImpl` | `trtllm.triton.grouped_gemm.fp8_block_scales` | SM120, BF16 activations; a Triton grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build gate); runs SwiGLU/GeGLU only, takes no expert bias and no activation constant but a uniform pre-SiLU SwiGLU clamp |
+| `fp8_block_scales` | `TrtllmTritonFp8BlockScalesImpl` | `trtllm.triton.grouped_gemm.fp8_block_scales` | SM120/SM121, BF16 activations; a Triton grouped GEMM that never enters C++ (`issues_fused_moe_op = False`, so no build gate); runs SwiGLU/GeGLU/Relu2, takes no expert bias and no activation constant but a uniform pre-SiLU SwiGLU clamp |
 | `nvfp4` | `TrtllmCutlassNvfp4Impl` | `trtllm.cutlass.grouped_gemm.nvfp4` | Quantizes activations to NVFP4 itself |
 | `w4a16_nvfp4` | `TrtllmCutlassW4a16Nvfp4Impl` | `trtllm.cutlass.grouped_gemm.w4a16_nvfp4` | Dequantizes the weights every forward, then runs unquantized |
 | `mxfp8` | `TrtllmCutlassMxfp8Impl` | `trtllm.cutlass.grouped_gemm.mxfp8` | Dynamic MXFP8 input |
@@ -287,7 +287,7 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
   on `quant_config`.
 - **FP8 block scales splits by SM.** Its two leaves carry the providers and
   techniques of the kernels they run (DeepGEMM, Triton), yet stay in the family
-  because the `CUTLASS` literal serves FP8 block scales on SM90 and SM120.
+  because the `CUTLASS` literal serves FP8 block scales on SM90 and SM120/SM121.
   `find_cutlass_leaf(quant_algo, *, sm=None)` (and `cutlass_leaf`, which
   raises instead of returning `None`) is a lookup, not an eligibility check, and
   reads the SM only to choose between those two.
@@ -599,7 +599,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 |---|---|---|---|---|---|---|---|---|---|---|
 | Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103/107, BF16, needs FlashInfer)§ | N | N | Y (SM107, BF16, SwiGLU only)¶ | N | N | Y (SM90, BF16) | N | Y |
 | FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y |
-| FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103/107) | Y (SM100/103/107) | N | N‡ | N | N | N | N | Y |
+| FP8 Block Scales | Y (SM90, SM120/121) | Y (SM100/103/107) | Y (SM100/103/107) | N | N‡ | N | N | N | N | Y |
 | NVFP4 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | Y (SM100/103) | Y (SM100/103/107/120/121)¶ | N | Y (SM100/103/107, cu13 cutlass-dsl + symmetric-memory provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
 | W4A16 NVFP4 | Y (SM80+, dequant-on-the-fly) | N | N | N | Y (SM120/121 via `CuteDslB12xW4a16Nvfp4FusedMoE`, needs flashinfer) | N | N | N | Y (SM89-SM99, BF16) | Y |
 | W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N |
@@ -658,9 +658,9 @@ and loops `torch.einsum` per expert. The only CuteDSL runners the file imports
 are the `Sm100BlockScaledContiguous*` NVFP4 ones. `can_implement` therefore
 declines FP8 block scales rather than claiming a reference path as a backend, and
 the algorithm's real owners are the DeepGEMM and TRTLLM-Gen leaves on
-SM100/103/107 and Cutlass on SM90/SM120. Consequence worth knowing before changing
+SM100/103/107 and Cutlass on SM90/SM120/SM121. Consequence worth knowing before changing
 this: because a `CUTEDSL` request only ever considers the CuteDSL family plus the
-Cutlass fallback, and Cutlass's FP8-block kernel stops at SM90/SM120, an explicit
+Cutlass fallback, and Cutlass's FP8-block kernel stops at SM90/SM120/SM121, an explicit
 `moe_backend="CUTEDSL"` on an FP8-block checkpoint at SM100 now fails resolution
 instead of silently running the reference GEMM. `test_cute_dsl_fp8_block_scales`
 and `test_cute_dsl_fp8_block_scales_4gpus` in
@@ -723,9 +723,9 @@ never from the checkpoint:
 `clamp_after_silu=True` is a separate execution capability rather than a
 register shape. The resolver declines a backend unless its declaration opts in,
 and materialization enforces the same contract. The CUTLASS grouped-GEMM leaves
-opt in because their SwiGLU adaptor consumes the mode. The SM120
+opt in because their SwiGLU adaptor consumes the mode. The SM120/SM121
 FP8-block-scale leaf runs a Triton kernel that clamps before the SiLU only and
-takes the clamp by value, so it declares `kinds={Swiglu, Geglu}` with
+takes the clamp by value, so it declares `kinds={Swiglu, Geglu, Relu2}` with
 `limit=UNIFORM_SCALAR` and nothing else.
 
 With `USING_OSS_CUTLASS_MOE_GEMM=OFF`, the Torch runner uses the bundled
@@ -746,7 +746,7 @@ The build mode is collected once into `MoEEnvironment.oss_cutlass_moe` and
 included in its fingerprint. Libraries without the build-mode query preserve
 the OSS default. One family gate, `cutlass/eligibility.check_oss_cutlass_build`,
 runs after the support gates in every CUTLASS leaf that issues
-`torch.ops.trtllm.fused_moe` (`issues_fused_moe_op`; not the SM120 Triton leaf)
+`torch.ops.trtllm.fused_moe` (`issues_fused_moe_op`; not the Triton leaf)
 and rejects SiTu and Relu2,
 the formats whose leaf sets `requires_oss_cutlass_build` (`MXFP8`,
 `W4A8_MXFP4_MXFP8`, `W4A16_MXFP4`, `W4A8_AWQ`), dynamic FC2 scaling on the leaf
@@ -890,8 +890,9 @@ and belongs in an override or a leaf-declared attribute. `TrtllmGenFusedMoEBase`
 keeps only flags read off the class at resolution (`supports_gptoss_style`,
 `supports_situ`) and turns the rest into hooks; `CutlassFusedMoEBase` takes its
 per-format kernel configuration as `FUSED_MOE_OP_FLAGS`, its padding as
-`pad_hidden_and_intermediate_to`, and its build requirements as
-`requires_oss_cutlass_build` / `uses_dynamic_fc2_scale`.
+`pad_hidden_and_intermediate_to` / `pad_intermediate_on_single_tp_rank_to`,
+and its build requirements as `requires_oss_cutlass_build` /
+`uses_dynamic_fc2_scale`.
 
 **Note on implementation class names:** the name is derived from the identity
 as `<Provider><Technique><Quant>Impl`. The kernel segment enters only when two
